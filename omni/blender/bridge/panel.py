@@ -94,10 +94,16 @@ class BlenderBridgePanel:
         self._menu_items = [
             MenuItemDescription(
                 name="Blender Bridge",
-                onclick_fn=lambda *_: setattr(self._window, 'visible', True),
+                ticked=True,
+                ticked_fn=lambda: self._window is not None and self._window.visible,
+                onclick_fn=lambda *_: self._toggle_window(),
             )
         ]
         omni.kit.menu.utils.add_menu_items(self._menu_items, "vtools")
+
+    def _toggle_window(self):
+        if self._window:
+            self._window.visible = not self._window.visible
     
     def _build_ui(self):
         """Build the main UI matching Scene Optimizer style"""
