@@ -35,7 +35,7 @@ from .styles import (
 
 
 WINDOW_TITLE = "Blender Bridge"
-MENU_PATH = "Window/Utilities/Blender Bridge"
+MENU_PATH = "vtools/Blender Bridge"
 
 
 def detect_blender_paths() -> List[Tuple[str, str]]:
@@ -97,7 +97,7 @@ class BlenderBridgePanel:
                 onclick_fn=lambda *_: setattr(self._window, 'visible', True),
             )
         ]
-        omni.kit.menu.utils.add_menu_items(self._menu_items, "Window/Utilities")
+        omni.kit.menu.utils.add_menu_items(self._menu_items, "vtools")
     
     def _build_ui(self):
         """Build the main UI matching Scene Optimizer style"""
@@ -498,5 +498,5 @@ class BlenderBridgePanel:
             self._edit_mesh_process.terminate()
             self._edit_mesh_process = None
         
-        omni.kit.menu.utils.remove_menu_items(self._menu_items, "Window/Utilities")
+        omni.kit.menu.utils.remove_menu_items(self._menu_items, "vtools")
         self._window = None
