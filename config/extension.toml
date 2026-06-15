@@ -1,0 +1,30 @@
+[core]
+reloadable = true
+order = 0
+
+[package]
+title = "Blender Bridge"
+version = "0.2.0"
+category = "Rendering"
+description = "Bridge between Omniverse and Blender for interactive mesh editing"
+authors = ["Vitus"]
+keywords = ["blender", "bridge", "edit", "mesh"]
+readme = "docs/README.md"
+changelog = "docs/CHANGELOG.md"
+
+[[python.module]]
+name = "omni.blender.bridge"
+
+[dependencies]
+"omni.kit.commands" = {}
+"omni.ui" = {}
+"omni.usd" = {}
+"omni.kit.menu.utils" = {}
+"omni.kit.window.filepicker" = {}
+
+[settings]
+exts."omni.blender.bridge".blender_path = ""
+
+[fswatcher]
+enabled = true
+patterns = ["*.py", "*.toml"]
