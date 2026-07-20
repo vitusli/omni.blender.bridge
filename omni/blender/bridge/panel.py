@@ -8,7 +8,10 @@ Main UI for Blender integration:
 """
 
 import asyncio
+import glob
 import os
+import re
+import shutil
 import subprocess
 from typing import List, Optional, Tuple
 
@@ -40,25 +43,60 @@ MENU_PATH = "vtools/Blender Bridge"
 
 def detect_blender_paths() -> List[Tuple[str, str]]:
     """
-    Detect installed Blender paths on Windows.
-    Returns list of (label, path) tuples.
+    Detect installed Blender executables on Windows.
+    Returns list of (display_label, path) tuples.
     """
     import getpass
+
+    def version_key(label: str):
+        match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", label)
+        if not match:
+            return (-1, -1, -1)
+        return tuple(int(part or 0) for part in match.groups())
+
+    def make_label(path: str) -> str:
+        parent = os.path.basename(os.path.dirname(path))
+        root = path.lower()
+
+        if "scoop\\apps\\blender" in root:
+            source = "Scoop"
+        elif "program files" in root:
+            source = "Program Files"
+        else:
+            source = os.path.basename(os.path.dirname(os.path.dirname(path))) or "Detected"
+
+        match = re.search(r"(\d+\.\d+(?:\.\d+)?)", parent)
+        if match:
+            version = match.group(1)
+            return f"Blender {version} ({source})"
+
+        return f"{parent} ({source})"
+
     username = getpass.getuser()
-    
-    candidates = [
-        ("Scoop", f"C:\\Users\\{username}\\scoop\\apps\\blender\\current\\blender.exe"),
-        ("Program Files", "C:\\Program Files\\Blender Foundation\\Blender 4.2\\blender.exe"),
-        ("Program Files", "C:\\Program Files\\Blender Foundation\\Blender 4.3\\blender.exe"),
-        ("Program Files", "C:\\Program Files\\Blender Foundation\\Blender 5.0\\blender.exe"),
+    patterns = [
+        r"C:\\Program Files\\Blender Foundation\\Blender *\\blender.exe",
+        r"C:\\Program Files (x86)\\Blender Foundation\\Blender *\\blender.exe",
+        fr"C:\\Users\\{username}\\AppData\\Local\\Programs\\Blender Foundation\\Blender *\\blender.exe",
+        fr"C:\\Users\\{username}\\scoop\\apps\\blender\\*\\blender.exe",
     ]
-    
-    found = []
-    for label, path in candidates:
-        if os.path.exists(path):
-            found.append((label, path))
-    
-    return found
+
+    candidates = []
+    for pattern in patterns:
+        candidates.extend(glob.glob(pattern))
+
+    on_path = shutil.which("blender.exe")
+    if on_path:
+        candidates.append(on_path)
+
+    unique = {}
+    for path in candidates:
+        norm_path = os.path.normpath(path)
+        if os.path.exists(norm_path):
+            unique[norm_path.lower()] = norm_path
+
+    detected = [(make_label(path), path) for path in unique.values()]
+    detected.sort(key=lambda item: (version_key(item[0]), item[0]), reverse=True)
+    return detected
 
 
 class BlenderBridgePanel:
@@ -141,30 +179,48 @@ class BlenderBridgePanel:
     
     def _build_blender_settings_row(self):
         """Build Blender path settings with auto-detect dropdown"""
+        saved_path = os.path.normcase(os.path.normpath(
+            self._settings.get("/exts/omni.blender.bridge/blender_path") or ""
+        ))
+        detected_paths = [os.path.normcase(os.path.normpath(path)) for _, path in self._blender_paths]
+        if saved_path in detected_paths:
+            selected_index = detected_paths.index(saved_path)
+        elif saved_path:
+            selected_index = len(self._blender_paths)
+        elif self._blender_paths:
+            selected_index = 0
+        else:
+            selected_index = len(self._blender_paths)
+
         with ui.VStack(spacing=SPACING):
             with ui.HStack(height=FIELD_HEIGHT, spacing=SPACING):
                 ui.Label("Blender", width=LABEL_WIDTH, style={"color": TEXT_NORMAL})
                 
                 # Build dropdown options
-                options = []
-                for label, path in self._blender_paths:
-                    options.append(f"{label}: {os.path.basename(os.path.dirname(path))}")
-                options.append("Custom...")
+                options = [label for label, _ in self._blender_paths]
+                options.append("Custom path...")
                 
-                self._blender_combo = ui.ComboBox(0, *options)
+                self._blender_combo = ui.ComboBox(selected_index, *options)
                 self._blender_combo.model.add_item_changed_fn(self._on_blender_selection_changed)
                 
                 ui.Circle(width=RESET_DOT_SIZE, height=RESET_DOT_SIZE,
                           style={"background_color": 0xFF4A4A4A})
             
             # Custom path field (hidden by default)
-            self._custom_blender_stack = ui.HStack(height=FIELD_HEIGHT, spacing=SPACING, visible=False)
+            self._custom_blender_stack = ui.HStack(
+                height=FIELD_HEIGHT,
+                spacing=SPACING,
+                visible=selected_index >= len(self._blender_paths),
+            )
             with self._custom_blender_stack:
                 ui.Label("Custom Path", width=LABEL_WIDTH, style={"color": TEXT_NORMAL})
                 self._blender_field = ui.StringField(style=FIELD_STYLE)
                 self._blender_field.model.set_value(
                     self._settings.get("/exts/omni.blender.bridge/blender_path") or "")
                 ui.Button("...", width=24, clicked_fn=self._browse_blender, style=ADD_BTN_STYLE)
+
+        if selected_index < len(self._blender_paths):
+            self._settings.set("/exts/omni.blender.bridge/blender_path", self._blender_paths[selected_index][1])
     
     def _on_blender_selection_changed(self, model, item):
         """Handle Blender dropdown selection change"""
@@ -353,12 +409,16 @@ class BlenderBridgePanel:
                 self._edit_btn.text = "Execute - Edit Mesh"
                 return
             
-            # Get script path (resolve symlinks: panel.py -> bridge -> blender -> omni -> omni.blender.bridge -> exts -> root)
+            # Resolve script path from this extension first; keep legacy fallback.
             real_file = os.path.realpath(__file__)
-            ext_dir = os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.dirname(os.path.dirname(real_file)))))  # exts/
-            baker_dir = os.path.dirname(ext_dir)  # baker/
-            script_path = os.path.join(baker_dir, "scripts", "edit_mesh_session.py")
+            ext_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(real_file))))
+            legacy_root = os.path.dirname(os.path.dirname(ext_root))
+            script_candidates = [
+                os.path.join(ext_root, "scripts", "edit_mesh_session.py"),
+                os.path.join(legacy_root, "scripts", "edit_mesh_session.py"),
+            ]
+            script_path = next((p for p in script_candidates if os.path.exists(p)), script_candidates[0])
+            carb.log_info(f"[BlenderBridge] Script candidates: {script_candidates}")
             carb.log_info(f"[BlenderBridge] Script path: {script_path}")
             carb.log_info(f"[BlenderBridge] Script exists: {os.path.exists(script_path)}")
             carb.log_info(f"[BlenderBridge] Export path: {self._edit_mesh_export_path}")

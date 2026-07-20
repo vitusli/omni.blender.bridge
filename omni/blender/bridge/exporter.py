@@ -33,6 +33,8 @@ async def export_meshes_to_usd(
     if not prim_paths:
         carb.log_warn("[BlenderBridge] No prim paths to export")
         return None
+
+    prim_paths = _normalize_prim_paths(prim_paths)
     
     # Determine output path
     if output_path is None:
@@ -63,7 +65,10 @@ async def export_meshes_to_usd(
             
             # Recursively copy geometry
             mesh_count += _copy_geometry_recursive(
-                stage, export_stage, src_prim, Sdf.Path.absoluteRootPath
+                stage,
+                export_stage,
+                src_prim,
+                src_prim.GetPath().GetParentPath(),
             )
         
         if mesh_count == 0:
@@ -125,6 +130,17 @@ def _copy_geometry_recursive(
             )
     
     return mesh_count
+
+
+def _normalize_prim_paths(prim_paths: List[str]) -> List[str]:
+    """Deduplicate and drop descendants when an ancestor path is already selected."""
+    unique = []
+    for path in sorted(set(prim_paths), key=lambda p: len(p)):
+        sdf_path = Sdf.Path(path)
+        if any(sdf_path.HasPrefix(Sdf.Path(parent)) for parent in unique):
+            continue
+        unique.append(path)
+    return unique
 
 
 def _copy_mesh(

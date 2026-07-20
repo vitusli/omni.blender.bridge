@@ -12,9 +12,31 @@ import carb
 from pxr import Sdf, Usd, UsdGeom, Vt
 
 
+def _expected_normal_count(interp: str, points_count: int, face_count: int, face_index_count: int) -> int:
+    if interp == UsdGeom.Tokens.vertex:
+        return points_count
+    if interp == UsdGeom.Tokens.faceVarying:
+        return face_index_count
+    if interp == UsdGeom.Tokens.uniform:
+        return face_count
+    if interp == UsdGeom.Tokens.constant:
+        return 1
+    return 0
+
+
 def path_segments(path_str: str) -> List[str]:
     """Split path into segments, filtering empty strings."""
     return [s for s in path_str.split('/') if s]
+
+
+def _normalize_paths(paths: List[str]) -> List[str]:
+    unique = []
+    for path in sorted(set(paths), key=lambda p: len(p)):
+        path_obj = Sdf.Path(path)
+        if any(path_obj.HasPrefix(Sdf.Path(parent)) for parent in unique):
+            continue
+        unique.append(path)
+    return unique
 
 
 def match_score(orig_segments: List[str], edit_segments: List[str], 
@@ -68,6 +90,8 @@ def patch_meshes_to_stage(stage: Usd.Stage, prim_paths: List[str], edited_usd_pa
         carb.log_error(f"[BlenderBridge] Could not open edited result: {edited_usd_path}")
         return 0
     
+    prim_paths = _normalize_paths(prim_paths)
+
     # Collect meshes from edited USD
     edit_meshes = []
     for prim in edit_stage.Traverse():
@@ -80,6 +104,14 @@ def patch_meshes_to_stage(stage: Usd.Stage, prim_paths: List[str], edited_usd_pa
     carb.log_info(f"[BlenderBridge] Found {len(edit_meshes)} meshes in edited result")
     
     patched = 0
+
+    # Author into current edit target (typically a session/override layer) when available.
+    current_target = stage.GetEditTarget()
+    target_layer = current_target.GetLayer() if current_target else None
+    if target_layer:
+        carb.log_info(f"[BlenderBridge] Patching into edit target layer: {target_layer.identifier}")
+    else:
+        carb.log_warn("[BlenderBridge] No explicit edit target layer; patching into default stage target")
     
     # Find and patch meshes
     for prim_path in prim_paths:
@@ -115,6 +147,10 @@ def patch_meshes_to_stage(stage: Usd.Stage, prim_paths: List[str], edited_usd_pa
                 count = _copy_geometry(prim, best_match, orig_path)
                 if count > 0:
                     patched += 1
+                    try:
+                        edit_meshes = [entry for entry in edit_meshes if entry[0] != best_match]
+                    except Exception:
+                        pass
     
     return patched
 
@@ -131,29 +167,85 @@ def _copy_geometry(stage_prim: Usd.Prim, edit_prim: Usd.Prim, orig_path: str) ->
     stage_mesh = UsdGeom.Mesh(stage_prim)
     
     try:
+        changed = False
+
+        # Ensure destination prim spec exists on current edit target as an over.
+        try:
+            stage = stage_prim.GetStage()
+            target = stage.GetEditTarget()
+            target_layer = target.GetLayer() if target else None
+            if target_layer:
+                stage_path = str(stage_prim.GetPath())
+                mapped_path = target.MapToSpecPath(stage_prim.GetPath())
+                spec_path = str(mapped_path) if mapped_path and mapped_path != Sdf.Path.emptyPath else stage_path
+                if not target_layer.GetPrimAtPath(spec_path):
+                    prim_spec = Sdf.CreatePrimInLayer(target_layer, spec_path)
+                    if prim_spec:
+                        prim_spec.specifier = Sdf.SpecifierOver
+        except Exception as e:
+            carb.log_warn(f"[BlenderBridge] Could not precreate over for {orig_path}: {e}")
+
         # Copy points (vertices)
         points = edit_mesh.GetPointsAttr().Get()
         if points:
-            stage_mesh.GetPointsAttr().Set(points)
+            stage_points = stage_mesh.GetPointsAttr().Get()
+            if stage_points != points:
+                stage_mesh.GetPointsAttr().Set(points)
+                changed = True
         
         # Copy face vertex counts
         face_counts = edit_mesh.GetFaceVertexCountsAttr().Get()
         if face_counts:
-            stage_mesh.GetFaceVertexCountsAttr().Set(face_counts)
+            stage_face_counts = stage_mesh.GetFaceVertexCountsAttr().Get()
+            if stage_face_counts != face_counts:
+                stage_mesh.GetFaceVertexCountsAttr().Set(face_counts)
+                changed = True
         
         # Copy face vertex indices
         face_indices = edit_mesh.GetFaceVertexIndicesAttr().Get()
         if face_indices:
-            stage_mesh.GetFaceVertexIndicesAttr().Set(face_indices)
+            stage_face_indices = stage_mesh.GetFaceVertexIndicesAttr().Get()
+            if stage_face_indices != face_indices:
+                stage_mesh.GetFaceVertexIndicesAttr().Set(face_indices)
+                changed = True
         
         # Copy normals if present
         normals = edit_mesh.GetNormalsAttr().Get()
         if normals:
-            stage_mesh.GetNormalsAttr().Set(normals)
-            stage_mesh.SetNormalsInterpolation(edit_mesh.GetNormalsInterpolation())
-        
-        carb.log_info(f"[BlenderBridge] Patched geometry: {orig_path}")
-        return 1
+            edit_interp = edit_mesh.GetNormalsInterpolation()
+            face_counts = face_counts if face_counts else stage_mesh.GetFaceVertexCountsAttr().Get()
+            face_indices = face_indices if face_indices else stage_mesh.GetFaceVertexIndicesAttr().Get()
+            points = points if points else stage_mesh.GetPointsAttr().Get()
+            expected_count = _expected_normal_count(
+                edit_interp,
+                len(points) if points else 0,
+                len(face_counts) if face_counts else 0,
+                len(face_indices) if face_indices else 0,
+            )
+
+            # Skip invalid normals that would corrupt Hydra/OV mesh import.
+            if expected_count > 0 and len(normals) != expected_count:
+                carb.log_warn(
+                    f"[BlenderBridge] Skipping normals for {orig_path}: "
+                    f"got {len(normals)}, expected {expected_count} for {edit_interp} interpolation"
+                )
+            else:
+                stage_normals = stage_mesh.GetNormalsAttr().Get()
+                if stage_normals != normals:
+                    stage_mesh.GetNormalsAttr().Set(normals)
+                    changed = True
+
+                stage_interp = stage_mesh.GetNormalsInterpolation()
+                if edit_interp != stage_interp:
+                    stage_mesh.SetNormalsInterpolation(edit_interp)
+                    changed = True
+
+        if changed:
+            carb.log_info(f"[BlenderBridge] Patched geometry: {orig_path}")
+            return 1
+
+        carb.log_info(f"[BlenderBridge] No geometry changes: {orig_path}")
+        return 0
         
     except Exception as e:
         carb.log_warn(f"[BlenderBridge] Failed to copy geometry for {orig_path}: {e}")
